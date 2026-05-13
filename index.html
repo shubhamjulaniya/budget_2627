@@ -786,6 +786,14 @@ function loadState() {
       });
       // Migration v3: ensure each account has openingBalance field
       state.accounts.forEach(a => { if (a.openingBalance === undefined) a.openingBalance = 0; });
+      // Migration: deduplicate state.balances — keep only the most recent entry per account
+      if (Array.isArray(state.balances) && state.balances.length) {
+        const latest = {};
+        state.balances.forEach(b => {
+          if (!latest[b.account] || b.date > latest[b.account].date) latest[b.account] = b;
+        });
+        state.balances = Object.values(latest);
+      }
       // Migration: load wealthItems and wealthRecons
       state.wealthItems  = parsed.wealthItems  || [];
       state.wealthRecons = parsed.wealthRecons || [];
@@ -1813,14 +1821,16 @@ function renderAccounts() {
 
     <h3 style="margin:18px 0 10px;color:var(--navy);font-size:15px;">Account Balance Tracker</h3>
     <p style="font-size:12px;color:var(--grey-500);margin-bottom:8px;">
-      Computed balance = opening balance ± all transactions tagged to each account. When you verify against your passbook, click <strong>Mark Reconciled</strong> to stamp the date.
+      Computed = opening ± all transactions. Actual = what your passbook says. Diff = gap to investigate.
     </p>
     <div class="card" style="padding:0;overflow-x:auto;">
       <table>
         <thead><tr>
           <th>Account</th>
-          <th class="numeric">Computed Balance</th>
-          <th class="center">Last Reconciled</th>
+          <th class="numeric">Computed</th>
+          <th class="numeric">Actual (last recon)</th>
+          <th class="numeric">Diff</th>
+          <th class="center">Reconciled On</th>
           <th class="center">Days Ago</th>
           <th class="center">Action</th>
         </tr></thead>
@@ -1829,20 +1839,33 @@ function renderAccounts() {
             const live = computedBalance(a.name);
             const basis = balanceBasis(a.name);
             let daysAgo = '—', daysCls = 'var-zero';
+            let actualCell = '<span style="color:var(--grey-400)">—</span>';
+            let diffCell = '<span style="color:var(--grey-400)">—</span>';
             if (basis.source === 'reconcile' && basis.baseDate) {
               const d = Math.floor((new Date() - new Date(basis.baseDate)) / 86400000);
               daysAgo = d + ' days';
               daysCls = d < 7 ? 'var-good' : d < 14 ? 'var-zero' : 'var-bad';
+              // Get the stored actual balance and diff from the reconciliation entry
+              const reconEntry = (state.balances||[]).find(b => b.account === a.name);
+              if (reconEntry) {
+                actualCell = `<span style="font-weight:700;">${fmtINR(reconEntry.balance)}</span>`;
+                const diff = reconEntry.diff ?? (reconEntry.balance - (reconEntry.computed || 0));
+                const diffRounded = Math.round(diff);
+                const diffCls = Math.abs(diffRounded) < 1 ? 'var-zero' : (diff < 0 ? 'var-bad' : 'var-good');
+                diffCell = `<span class="${diffCls}" style="font-weight:700;">${Math.abs(diffRounded)<1 ? '✓ 0' : (diff>0?'+':'')+fmtINR(diff)}</span>`;
+              }
             } else {
               daysAgo = 'never'; daysCls = 'var-bad';
             }
             return `<tr>
               <td><strong>${escapeHTML(a.name)}</strong> <span style="font-size:10px;color:var(--grey-400);text-transform:uppercase;">(${a.type})</span></td>
-              <td class="numeric" style="font-weight:700;color:var(--navy);font-size:16px;">${fmtINR(live)}</td>
+              <td class="numeric" style="font-weight:700;color:var(--navy);">${fmtINR(live)}</td>
+              <td class="numeric">${actualCell}</td>
+              <td class="numeric">${diffCell}</td>
               <td class="center">${basis.source === 'reconcile' ? fmtDate(basis.baseDate) : '<em style="color:var(--grey-400)">Not yet</em>'}</td>
               <td class="center ${daysCls}" style="font-weight:600;">${daysAgo}</td>
               <td class="center">
-                <button class="btn btn-success btn-sm" onclick="openReconcileModal('${escapeHTML(a.name).replace(/'/g,"\\'")}')">✓ Mark Reconciled</button>
+                <button class="btn btn-success btn-sm" onclick="openReconcileModal('${escapeHTML(a.name).replace(/'/g,"\\'")}')">Reconcile</button>
               </td>
             </tr>`;
           }).join('')}
@@ -1937,10 +1960,11 @@ function deleteAccount(accIdx) {
 
 // Reconcile modal (replaces openBalanceModal naming for clarity but keeps backward compat)
 function openReconcileModal(presetAccount='') {
+  const presetComputed = presetAccount ? (computedBalance(presetAccount) || 0) : 0;
   document.getElementById('modalContent').innerHTML = `
-    <h3>Mark as Reconciled</h3>
+    <h3>Reconcile Account</h3>
     <p style="font-size:12px;color:var(--grey-500);margin-bottom:12px;">
-      Records that you verified this account against your passbook on this date. The computed balance is locked as-is from here.
+      Enter the actual balance from your bank passbook/app. Any previous reconciliation entries for this account will be replaced.
     </p>
     <form id="balForm" onsubmit="event.preventDefault();saveBalance();">
       <div class="form-grid">
@@ -1948,21 +1972,49 @@ function openReconcileModal(presetAccount='') {
           <input type="date" name="date" value="${todayISO()}" required/>
         </div>
         <div class="form-group"><label>Account</label>
-          <select name="account">
+          <select name="account" onchange="updateReconComputed(this.value)">
             ${state.accounts.map(a => `<option ${a.name===presetAccount?'selected':''}>${escapeHTML(a.name)}</option>`).join('')}
           </select>
         </div>
-        <div class="form-group" style="grid-column:1/-1;"><label>Note (optional)</label>
-          <input type="text" name="note" placeholder="e.g. Checked passbook — all good"/>
+        <div class="form-group"><label>Computed Balance</label>
+          <input type="text" id="reconComputedDisplay" value="${fmtINR(presetComputed)}" disabled style="background:var(--grey-100);color:var(--grey-500);"/>
+        </div>
+        <div class="form-group"><label>Actual Balance (₹) <span style="color:var(--grey-400);font-weight:400;">— from passbook</span></label>
+          <input type="number" step="0.01" name="balance" required placeholder="0" oninput="updateReconDiff()"/>
+        </div>
+        <div class="form-group"><label>Difference</label>
+          <input type="text" id="reconDiffDisplay" value="—" disabled style="background:var(--grey-100);font-weight:700;"/>
+        </div>
+        <div class="form-group"><label>Note (optional)</label>
+          <input type="text" name="note" placeholder="e.g. Checked passbook"/>
         </div>
       </div>
       <div class="modal-actions">
         <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-        <button type="submit" class="btn btn-primary">Save</button>
+        <button type="submit" class="btn btn-primary">Save Reconciliation</button>
       </div>
     </form>
   `;
   document.getElementById('modalOverlay').classList.add('open');
+}
+function updateReconComputed(accountName) {
+  const comp = computedBalance(accountName) || 0;
+  const el = document.getElementById('reconComputedDisplay');
+  if (el) el.value = fmtINR(comp);
+  updateReconDiff();
+}
+function updateReconDiff() {
+  const balInput = document.querySelector('#balForm [name="balance"]');
+  const compEl = document.getElementById('reconComputedDisplay');
+  const diffEl = document.getElementById('reconDiffDisplay');
+  if (!balInput || !compEl || !diffEl) return;
+  const actual = parseFloat(balInput.value);
+  const compText = compEl.value.replace(/[₹,\s]/g,'');
+  const comp = parseFloat(compText) || 0;
+  if (isNaN(actual)) { diffEl.value = '—'; diffEl.style.color = 'var(--grey-400)'; return; }
+  const diff = actual - comp;
+  diffEl.value = (diff >= 0 ? '+' : '') + fmtINR(diff);
+  diffEl.style.color = Math.abs(diff) < 1 ? 'var(--grey-400)' : (diff < 0 ? 'var(--red)' : 'var(--green)');
 }
 
 // ---------- Render: Wealth & Assets ----------
@@ -2959,10 +3011,13 @@ function saveBalance() {
   const fd = new FormData(f);
   const accountName = fd.get('account');
   const date = fd.get('date');
-  if (!date || !accountName) { showToast('Please fill all fields', 'error'); return; }
-  // Store computed balance at the time of reconciliation (not user-entered)
-  const computedAtDate = computedBalance(accountName, date) || 0;
-  const b = { id:uid(), date, account:accountName, balance:computedAtDate, note: fd.get('note')||'' };
+  const actual = Number(fd.get('balance'));
+  if (!date || !accountName || !isFinite(actual)) { showToast('Please fill all fields', 'error'); return; }
+  // Remove ALL previous reconciliation entries for this account — only ever keep one (the latest)
+  state.balances = (state.balances||[]).filter(b => b.account !== accountName);
+  const computed = computedBalance(accountName, date) || 0;
+  const diff = actual - computed;
+  const b = { id:uid(), date, account:accountName, balance:actual, computed, diff, note: fd.get('note')||'' };
   state.balances.push(b);
   saveState();
   closeModal();
@@ -3561,12 +3616,16 @@ async function applyRemoteState(remoteState) {
   state.budget        = remoteState.budget        || [];
   state.transactions  = remoteState.transactions  || [];
   state.accounts      = remoteState.accounts      || JSON.parse(JSON.stringify(DEFAULT_ACCOUNTS));
-  state.balances      = remoteState.balances      || [];
   state.wealthItems   = remoteState.wealthItems   || [];
   state.wealthRecons  = remoteState.wealthRecons  || [];
   state.selectedCycle = remoteState.selectedCycle || currentCycleName();
   // Backfill openingBalance for any old wealthItems that predate the field
   state.wealthItems.forEach(w => { if (w.openingBalance === undefined) w.openingBalance = Number(w.value)||0; });
+  // Deduplicate balances — keep only the most recent reconciliation entry per account
+  const _rawBal = remoteState.balances || [];
+  const _latestBal = {};
+  _rawBal.forEach(b => { if (!_latestBal[b.account] || b.date > _latestBal[b.account].date) _latestBal[b.account] = b; });
+  state.balances = Object.values(_latestBal);
   if (Array.isArray(remoteState.sections) && remoteState.sections.length) {
     state.sections = remoteState.sections;
     SECTIONS.length = 0;
