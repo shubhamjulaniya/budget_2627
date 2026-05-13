@@ -3639,11 +3639,28 @@ async function applyRemoteState(remoteState) {
   const _latestBal = {};
   _rawBal.forEach(b => { if (!_latestBal[b.account] || b.date > _latestBal[b.account].date) _latestBal[b.account] = b; });
   state.balances = Object.values(_latestBal);
+  // Load sections from Firestore, then heal any missing ones
   if (Array.isArray(remoteState.sections) && remoteState.sections.length) {
-    state.sections = remoteState.sections;
-    SECTIONS.length = 0;
-    SECTIONS.push(...state.sections);
+    state.sections = [...remoteState.sections];
+  } else {
+    // Derive from budget rows if sections array missing entirely
+    const fromBudget = [];
+    state.budget.forEach(b => { if (b.section && !fromBudget.includes(b.section)) fromBudget.push(b.section); });
+    state.sections = fromBudget.length ? fromBudget : [...DEFAULT_SECTIONS];
   }
+  // Heal: ensure every section referenced in budget rows is in sections list
+  state.budget.forEach(b => {
+    if (b.section && !state.sections.includes(b.section)) state.sections.push(b.section);
+  });
+  // Heal: ensure every section referenced in transactions is in sections list
+  state.transactions.forEach(t => {
+    if (t.section && t.section !== 'Income' && !state.sections.includes(t.section)) state.sections.push(t.section);
+  });
+  // Heal: reserved sections always present
+  RESERVED_SECTIONS.forEach(s => { if (!state.sections.includes(s)) state.sections.push(s); });
+  // Sync SECTIONS global
+  SECTIONS.length = 0;
+  SECTIONS.push(...state.sections);
   refreshActiveView();
 }
 
