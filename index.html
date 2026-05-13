@@ -958,21 +958,17 @@ function txAffectAccount(t, accountName) {
   if (t.account !== accountName) return 0;
   return t.section === 'Income' ? amt : -amt;
 }
-// Computed balance = (latest reconciliation entry on/before asOf) + tx after that entry up to asOf
-// If no reconciliation entry, uses account.openingBalance
+// Computed balance = opening balance + ALL transactions up to asOf
+// Reconciliation entries are NOT used as a base — they are only for recording actual vs computed.
+// This means computed is always a pure function of (openingBalance + transactions).
 function computedBalance(accountName, asOf=null) {
   const acc = state.accounts.find(a => a.name === accountName);
   if (!acc) return null;
   const asOfStr = asOf || todayISO();
-  const entries = state.balances
-    .filter(b => b.account === accountName && b.date <= asOfStr)
-    .sort((a,b) => b.date.localeCompare(a.date));
-  let baseBal, baseDate;
-  if (entries.length) { baseBal = Number(entries[0].balance)||0; baseDate = entries[0].date; }
-  else                { baseBal = Number(acc.openingBalance)||0; baseDate = '0000-00-00'; }
+  const baseBal = Number(acc.openingBalance) || 0;
   const delta = state.transactions
     .filter(t =>
-      t.date > baseDate && t.date <= asOfStr &&
+      t.date <= asOfStr &&
       (t.account === accountName || t.fromAccount === accountName || t.toAccount === accountName)
     )
     .reduce((s,t) => s + txAffectAccount(t, accountName), 0);
@@ -2022,6 +2018,9 @@ let wealthCompChart = null, wealthTrendChart = null;
 function renderWealth() {
   if (!Array.isArray(state.wealthItems))  state.wealthItems  = [];
   if (!Array.isArray(state.wealthRecons)) state.wealthRecons = [];
+  // Capture filter values BEFORE rebuilding HTML (DOM gets wiped on re-render)
+  const _wlhFilterItem  = document.getElementById('wlhFilterItem')?.value  || '';
+  const _wlhFilterMonth = document.getElementById('wlhFilterMonth')?.value || '';
 
   const isLiabAcc = (a) => a.type === 'credit' || a.type === 'loan' || a.type === 'liability';
   const assetAccounts = state.accounts.filter(a => !isLiabAcc(a));
@@ -2226,14 +2225,14 @@ function renderWealth() {
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px;align-items:center;">
       <select id="wlhFilterItem" onchange="renderWealth()" style="padding:6px 10px;border-radius:8px;border:1px solid var(--grey-200);font-size:13px;background:white;">
         <option value="">All Items</option>
-        ${(state.wealthItems||[]).map(w => `<option value="${escapeHTML(w.name)}">${escapeHTML(w.name)}</option>`).join('')}
+        ${(state.wealthItems||[]).map(w => `<option value="${escapeHTML(w.name)}" ${_wlhFilterItem===w.name?'selected':''}>${escapeHTML(w.name)}</option>`).join('')}
       </select>
       <select id="wlhFilterMonth" onchange="renderWealth()" style="padding:6px 10px;border-radius:8px;border:1px solid var(--grey-200);font-size:13px;background:white;">
         <option value="">All Months</option>
         ${['2026-04','2026-05','2026-06','2026-07','2026-08','2026-09','2026-10','2026-11','2026-12','2027-01','2027-02','2027-03'].map(m => {
           const [y,mo] = m.split('-');
           const label = new Date(Number(y), Number(mo)-1, 1).toLocaleString('default',{month:'short',year:'numeric'});
-          return `<option value="${m}">${label}</option>`;
+          return `<option value="${m}" ${_wlhFilterMonth===m?'selected':''}>${label}</option>`;
         }).join('')}
       </select>
       <span id="wlhTotal" style="font-size:12px;color:var(--grey-500);margin-left:4px;"></span>
@@ -2248,8 +2247,8 @@ function renderWealth() {
             if (!Array.isArray(state.wealthItems) || !state.wealthItems.length)
               return `<tr><td colspan="7" class="empty">No wealth items yet</td></tr>`;
 
-            const filterItem  = document.getElementById('wlhFilterItem')?.value  || '';
-            const filterMonth = document.getElementById('wlhFilterMonth')?.value || '';
+            const filterItem  = _wlhFilterItem;
+            const filterMonth = _wlhFilterMonth;
 
             // Build one unified log per item: opening, tx impacts, recons
             const rows = [];
@@ -2297,7 +2296,9 @@ function renderWealth() {
               return true;
             });
 
-            // Update total count label
+            // Compute grand total of Change column (sum of non-null changes in filtered rows)
+            const grandTotal = filtered.reduce((s, r) => s + (r.change !== null ? (r.change||0) : 0), 0);
+            // Update total count + sum label
             setTimeout(() => {
               const el = document.getElementById('wlhTotal');
               if (el) el.textContent = filtered.length ? `${filtered.length} entries` : '';
@@ -2305,7 +2306,7 @@ function renderWealth() {
 
             if (!filtered.length) return `<tr><td colspan="7" class="empty">No entries match the filter</td></tr>`;
 
-            return filtered.map(r => {
+            const rows_html = filtered.map(r => {
               const typePill = r.type === 'opening'
                 ? `<span style="background:var(--blue-soft);color:var(--blue-text);padding:2px 7px;border-radius:100px;font-size:11px;font-weight:700;">Opening</span>`
                 : r.type === 'recon'
@@ -2326,6 +2327,16 @@ function renderWealth() {
                 <td class="center">${delBtn}</td>
               </tr>`;
             }).join('');
+            const totalCls = grandTotal >= 0 ? 'var(--green)' : 'var(--red)';
+            return rows_html + `<tr style="border-top:2px solid var(--grey-200);background:var(--grey-50);">
+              <td colspan="3" style="font-weight:700;font-size:13px;color:var(--grey-700);padding:8px 12px;">
+                Grand Total (${filtered.length} entries)
+              </td>
+              <td class="numeric" style="font-weight:700;font-size:14px;color:${totalCls};">
+                ${grandTotal>=0?'+':''}${fmtINR(grandTotal)}
+              </td>
+              <td colspan="3"></td>
+            </tr>`;
           })()}
         </tbody>
       </table>
