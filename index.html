@@ -1091,9 +1091,11 @@ function renderDashboard() {
     </tr>`;
 
     sectionsInSuper.forEach(sec => {
-    if (!grouped[sec].length) return;
+    const secActual = actualByCycle(cycle, s => s === sec);
+    if (!grouped[sec].length && secActual === 0) return;
     const subBud = grouped[sec].reduce((s,d) => s + (Number(d.monthly)||0), 0);
-    const subAct = grouped[sec].reduce((s,d) => s + actualForBudgetRow(cycle, sec, d.subcategory), 0);
+    // Use section-level actual (catches transactions with no matching budget row)
+    const subAct = actualByCycle(cycle, s => s === sec);
     const subVar = subAct - subBud;
     const subPct = subBud ? subVar / subBud : null;
     const isCollapsed = !!collapsedSections[sec];
