@@ -850,6 +850,8 @@ function loadState() {
       state.transactions = parsed.transactions || [];
       state.accounts     = parsed.accounts     || JSON.parse(JSON.stringify(DEFAULT_ACCOUNTS));
       state.balances     = parsed.balances     || [];
+      state.wealthItems  = parsed.wealthItems  || [];
+      state.tags         = parsed.tags         || {};  // preserve custom vendor tags per sub-category
       state.selectedCycle = parsed.selectedCycle || currentCycleName();
       // Migration v2: rename "Misc Living" -> "Misc" within Mumbai
       state.budget.forEach(b => { if (b.section==='Mumbai' && b.subcategory==='Misc Living') b.subcategory='Misc'; });
@@ -1876,7 +1878,7 @@ function renderTransactionsTable() {
         <td>${fmtDate(t.date)}</td>
         <td>${escapeHTML(t.description||'')}</td>
         <td><span class="section-pill" style="background:var(--blue-text);color:white;">Transfer</span></td>
-        <td>${escapeHTML(t.fromAccount||'')} → ${escapeHTML(t.toAccount||'')}</td>
+        <td>${escapeHTML(t.fromAccount || (t.fromWealthItem ? 'W: '+t.fromWealthItem : ''))} → ${escapeHTML(t.toAccount || (t.toWealthItem ? 'W: '+t.toWealthItem : ''))}</td>
         <td>—</td>
         <td>—</td>
         <td>—</td>
@@ -3083,15 +3085,38 @@ function openTransactionModal(editId=null) {
           </select>
         </div>
 
-        <!-- Transfer fields -->
-        <div class="form-group txXferFld"><label>From Account</label>
-          <select name="fromAccount">
-            ${state.accounts.map(a => `<option ${a.name===t.fromAccount?'selected':''}>${a.name}</option>`).join('')}
+        <!-- Transfer fields: now supports Accounts AND Wealth Items -->
+        <div class="form-group txXferFld"><label>From (Account or Wealth Item)</label>
+          <select name="fromSide">
+            <optgroup label="Accounts (cash)">
+              ${state.accounts.map(a => {
+                const selected = (!t.fromWealthItem && a.name===t.fromAccount) ? 'selected' : '';
+                return `<option value="acc:${escapeHTML(a.name)}" ${selected}>${escapeHTML(a.name)}</option>`;
+              }).join('')}
+            </optgroup>
+            <optgroup label="Wealth Items (assets/liabilities)">
+              ${(state.wealthItems||[]).map(w => {
+                const selected = (t.fromWealthItem===w.name) ? 'selected' : '';
+                return `<option value="wealth:${escapeHTML(w.name)}" ${selected}>${escapeHTML(w.name)} (${w.type})</option>`;
+              }).join('')}
+            </optgroup>
           </select>
         </div>
-        <div class="form-group txXferFld"><label>To Account</label>
-          <select name="toAccount">
-            ${state.accounts.map((a,i) => `<option ${a.name===t.toAccount?'selected':(i===1&&!t.toAccount?'selected':'')}>${a.name}</option>`).join('')}
+        <div class="form-group txXferFld"><label>To (Account or Wealth Item)</label>
+          <select name="toSide">
+            <optgroup label="Accounts (cash)">
+              ${state.accounts.map((a,i) => {
+                const defaultSel = (!t.toWealthItem && !t.toAccount && i===1) ? 'selected' : '';
+                const selected = (!t.toWealthItem && a.name===t.toAccount) ? 'selected' : defaultSel;
+                return `<option value="acc:${escapeHTML(a.name)}" ${selected}>${escapeHTML(a.name)}</option>`;
+              }).join('')}
+            </optgroup>
+            <optgroup label="Wealth Items (assets/liabilities)">
+              ${(state.wealthItems||[]).map(w => {
+                const selected = (t.toWealthItem===w.name) ? 'selected' : '';
+                return `<option value="wealth:${escapeHTML(w.name)}" ${selected}>${escapeHTML(w.name)} (${w.type})</option>`;
+              }).join('')}
+            </optgroup>
           </select>
         </div>
 
@@ -3164,16 +3189,31 @@ function saveTransaction(editId) {
   const f = document.getElementById('txForm');
   const fd = new FormData(f);
   const isTransfer = fd.get('type') === 'transfer';
-  const t = isTransfer ? {
-    id: editId || uid(),
-    type: 'transfer',
-    date: fd.get('date'),
-    description: fd.get('description').trim(),
-    amount: Number(fd.get('amount')),
-    fromAccount: fd.get('fromAccount'),
-    toAccount: fd.get('toAccount'),
-    notes: fd.get('notes')||'',
-  } : (() => {
+  const t = isTransfer ? (() => {
+    // Parse "acc:Name" or "wealth:Name" prefixes
+    const parseSide = (val) => {
+      if (!val) return { kind: null, name: null };
+      if (val.startsWith('acc:')) return { kind: 'account', name: val.slice(4) };
+      if (val.startsWith('wealth:')) return { kind: 'wealth', name: val.slice(7) };
+      // Backward compat: treat raw string as account
+      return { kind: 'account', name: val };
+    };
+    const from = parseSide(fd.get('fromSide') || fd.get('fromAccount'));
+    const to   = parseSide(fd.get('toSide')   || fd.get('toAccount'));
+    const rec = {
+      id: editId || uid(),
+      type: 'transfer',
+      date: fd.get('date'),
+      description: fd.get('description').trim(),
+      amount: Number(fd.get('amount')),
+      notes: fd.get('notes')||'',
+    };
+    if (from.kind === 'account')    rec.fromAccount    = from.name;
+    if (from.kind === 'wealth')     rec.fromWealthItem = from.name;
+    if (to.kind   === 'account')    rec.toAccount      = to.name;
+    if (to.kind   === 'wealth')     rec.toWealthItem   = to.name;
+    return rec;
+  })() : (() => {
     const wealthOn = document.getElementById('wealthImpactToggle')?.checked;
     const wealthItemName = (fd.get('wealthImpactItem')||'').trim();
     const wealthDir = fd.get('wealthImpactDir') || 'reduce';
@@ -3197,9 +3237,20 @@ function saveTransaction(editId) {
     showToast('Please fill date, description, and amount', 'error');
     return;
   }
-  if (isTransfer && t.fromAccount === t.toAccount) {
-    showToast('From and To accounts must differ', 'error');
-    return;
+  if (isTransfer) {
+    const fromKey = t.fromAccount ? `acc:${t.fromAccount}` : (t.fromWealthItem ? `wealth:${t.fromWealthItem}` : null);
+    const toKey   = t.toAccount   ? `acc:${t.toAccount}`   : (t.toWealthItem   ? `wealth:${t.toWealthItem}`   : null);
+    if (!fromKey || !toKey) { showToast('From and To required', 'error'); return; }
+    if (fromKey === toKey) { showToast('From and To must differ', 'error'); return; }
+    // If editing existing wealth-transfer, first reverse the prior effect
+    if (editId) {
+      const prior = state.transactions.find(x => x.id === editId);
+      if (prior && prior.type === 'transfer') {
+        applyWealthTransferEffect(prior, -1);  // reverse
+      }
+    }
+    // Apply new wealth-item effect (if any)
+    applyWealthTransferEffect(t, +1);
   }
   const beforeYTD = snapshotSavingsYTD();
   const beforeBud = snapshotBudget();
@@ -3232,11 +3283,28 @@ function applyWealthImpact(impact, reverse=false) {
   if (!w) return;
   w.updatedAt = new Date().toISOString();
 }
+// Apply wealth-item effect of a transfer. sign=+1 to apply, -1 to reverse.
+// Account sides are handled by txAffectAccount automatically — only wealth sides need direct mutation.
+function applyWealthTransferEffect(txn, sign) {
+  if (!txn || txn.type !== 'transfer') return;
+  const amt = (Number(txn.amount)||0) * sign;
+  if (txn.fromWealthItem) {
+    const w = (state.wealthItems||[]).find(x => x.name === txn.fromWealthItem);
+    if (w) w.value = (Number(w.value)||0) - amt;
+  }
+  if (txn.toWealthItem) {
+    const w = (state.wealthItems||[]).find(x => x.name === txn.toWealthItem);
+    if (w) w.value = (Number(w.value)||0) + amt;
+  }
+}
+
 function deleteTransaction(id) {
   if (!confirm('Delete this transaction?')) return;
-  // Reverse wealth impact if present
   const tx = state.transactions.find(t => t.id === id);
+  // Reverse wealth impact if present
   if (tx?.wealthImpact) applyWealthImpact(tx.wealthImpact, true);
+  // Reverse wealth transfer effect if present
+  if (tx?.type === 'transfer') applyWealthTransferEffect(tx, -1);
   state.transactions = state.transactions.filter(t => t.id !== id);
   saveState();
   refreshActiveView();
@@ -3907,6 +3975,7 @@ async function applyRemoteState(remoteState) {
   state.accounts      = remoteState.accounts      || JSON.parse(JSON.stringify(DEFAULT_ACCOUNTS));
   state.wealthItems   = remoteState.wealthItems   || [];
   state.wealthRecons  = remoteState.wealthRecons  || [];
+  state.tags          = remoteState.tags          || {};  // preserve custom vendor tags per sub-category
   state.selectedCycle = remoteState.selectedCycle || currentCycleName();
   // Backfill openingBalance for any old wealthItems that predate the field
   state.wealthItems.forEach(w => { if (w.openingBalance === undefined) w.openingBalance = Number(w.value)||0; });
